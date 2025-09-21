@@ -114,7 +114,6 @@ class AgentState(TypedDict):
     context: str
     answer: str
     bert_intent: Optional[str] # Menyimpan hasil klasifikasi dari BERT
-    data_summary: Optional[str] # Ringkasan statistik dari pandas
 
 # ==============================
 # 🤖 Agent 1: BERT Router
@@ -162,62 +161,66 @@ def bert_router_agent(state: AgentState):
     return state
 
 # ==============================
-# 🤖 Agent 2: Classifier (Parameter Extractor)
+# 🤖 Agent 2: Classifier (Parameter Extractor & Mode Refiner)
 # ==============================
 def classifier_agent(state: AgentState):
     """
-    Mengekstrak semua parameter yang mungkin dari pertanyaan untuk mendukung query multi-kriteria.
-    Mode diatur langsung dari intent BERT.
+    Mengekstrak semua parameter dan menyempurnakan 'mode' berdasarkan kata kunci
+    untuk memastikan tindakan yang paling spesifik dieksekusi.
     """
     try:
         q = state["question"].lower()
         bert_intent = state.get("bert_intent", "general_fallback")
         params = {}
         
-        # Set mode langsung dari klasifikasi BERT
-        state["mode"] = bert_intent
+        # Set mode awal dari klasifikasi BERT
+        current_mode = bert_intent
+        state["mode"] = current_mode
 
         def find_param(pattern, text, group=1):
             match = re.search(pattern, text)
             return match.group(group).strip() if match else None
 
-        # Ekstraksi Area
-        area_match = find_param(r'area\s+(rmk1|rmk2|fmd|rmp)', q)
-        if area_match: params['area'] = area_match
+        # Peta terstruktur untuk ekstraksi parameter
+        PARAMETER_PATTERNS = {
+            'area': [r'area\s+(rmk1|rmk2|fmd|rmp)', r'\b(fmd|rmk1|rmk2|rmp)\b'],
+            'status': [r'status\s+(done|belum|confirmed)', r'\b(done|belum|confirmed)\b'],
+            'urgensi': [r'urgensi\s+(high|med|low)', r'\b(high|med|low)\b'],
+            'pic': [r'pic\s+([a-z\s]+?)(?=\sdi|\sdengan|\sarea|$)', r'oleh\s+([a-z\s]+?)(?=\sdi|\sdengan|\sarea|$)'],
+            'hac': [r'hac\s+([a-z0-9\s\.\-_]+)'],
+            'tanggal': [r'tanggal\s+([0-9\-\/]+)'],
+            'tanggal_awal': [r'antara\s+([0-9\-\/]+)'],
+            'tanggal_akhir': [r'sampai\s+([0-9\-\/]+)'],
+        }
 
-        # Ekstraksi Status
-        status_match = find_param(r'status\s+(done|belum|confirmed)', q)
-        if status_match: params['status'] = status_match.capitalize()
-        elif "sudah selesai" in q or "statusnya done" in q: params['status'] = "Done"
-        elif "statusnya belum" in q: params['status'] = "Belum"
-
-        # Ekstraksi Urgensi
-        urgency_match = find_param(r'urgensi\s+(high|med|low)', q)
-        if urgency_match: params['urgensi'] = urgency_match.capitalize()
-
-        # Ekstraksi PIC
-        pic_match = find_param(r'pic\s+([a-z\s]+?)(?=\sdi|\sdengan|\sarea|$)', q) or find_param(r'oleh\s+([a-z\s]+?)(?=\sdi|\sdengan|\sarea|$)', q)
-        if pic_match: params['pic'] = pic_match
+        for param_name, patterns in PARAMETER_PATTERNS.items():
+            for pattern in patterns:
+                match = find_param(pattern, q)
+                if match:
+                    if param_name in ['status', 'urgensi']:
+                        params[param_name] = match.capitalize()
+                    else:
+                        params[param_name] = match
+                    break
         
-        # Ekstraksi HAC
-        hac_match = find_param(r'hac\s+([a-z0-9\s\.\-_]+)', q)
-        if hac_match: params['hac'] = hac_match
+        if 'status' not in params:
+            if "sudah selesai" in q or "statusnya done" in q: params['status'] = "Done"
+            elif "statusnya belum" in q: params['status'] = "Belum"
 
-        # Ekstraksi Tanggal dan Rentang Tanggal
-        start_date_match = find_param(r'antara\s+([0-9\-\/]+)', q)
-        end_date_match = find_param(r'sampai\s+([0-9\-\/]+)', q)
-        if start_date_match and end_date_match:
-            params['tanggal_awal'] = start_date_match
-            params['tanggal_akhir'] = end_date_match
-        else:
-            date_match = find_param(r'tanggal\s+([0-9\-\/]+)', q)
-            if date_match: params['tanggal'] = date_match
-        
-        # Ekstraksi Bulan
         month_match = re.search(r'bulan\s+(januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember)', q)
         if month_match:
             month_map = {'januari': 1, 'februari': 2, 'maret': 3, 'april': 4, 'mei': 5, 'juni': 6, 'juli': 7, 'agustus': 8, 'september': 9, 'oktober': 10, 'november': 11, 'desember': 12}
             params['bulan'] = month_map[month_match.group(1)]
+
+        # --- Penyempurnaan Mode ---
+        # Jika ada kata kunci tindakan yang lebih spesifik, ganti mode.
+        # Ini menangani kasus "FMD terbaru" di mana BERT mungkin hanya memilih 'filter_data_query'.
+        if "terbaru" in q or "terkini" in q:
+            state["mode"] = "latest_query"
+        elif "terlama" in q or "terdahulu" in q:
+            state["mode"] = "oldest_query"
+        elif "jumlah" in q or "berapa banyak" in q and bert_intent != 'comparison_query':
+             state["mode"] = "count_query"
 
         state["params"] = params
             
@@ -229,57 +232,7 @@ def classifier_agent(state: AgentState):
     return state
 
 # ==============================
-# 🤖 Agent 3: Data Describer
-# ==============================
-def data_describer_agent(state: AgentState):
-    """
-    Membuat ringkasan statistik deskriptif dari data berdasarkan parameter
-    untuk memberikan konteks yang padat kepada agent selanjutnya.
-    """
-    try:
-        if df is None:
-            state["data_summary"] = "Data tidak tersedia untuk dianalisis."
-            return state
-
-        params = state.get("params", {})
-        summary_parts = []
-        
-        PARAM_TO_COLUMN_MAP = {
-            'area': 'Area',
-            'status': 'Status',
-            'urgensi': 'Level Urgensi',
-            'pic': 'PIC'
-        }
-        
-        relevant_cols = [key for key in PARAM_TO_COLUMN_MAP.keys() if key in params]
-
-        if len(relevant_cols) >= 2:
-            # Jika ada 2+ parameter relevan, buat crosstab.
-            col1_key, col2_key = relevant_cols[0], relevant_cols[1]
-            col1_name, col2_name = PARAM_TO_COLUMN_MAP[col1_key], PARAM_TO_COLUMN_MAP[col2_key]
-            
-            cross_tab = pd.crosstab(df[col1_name], df[col2_name])
-            summary_parts.append(f"Ringkasan Silang antara '{col1_name}' dan '{col2_name}':\n" + cross_tab.to_string())
-        
-        elif len(relevant_cols) == 1:
-            col_key = relevant_cols[0]
-            col_name = PARAM_TO_COLUMN_MAP[col_key]
-            counts = df[col_name].value_counts().to_string()
-            summary_parts.append(f"Distribusi untuk kolom '{col_name}':\n" + counts)
-
-        if not summary_parts:
-             state["data_summary"] = "Tidak ada ringkasan statistik yang relevan untuk pertanyaan ini."
-        else:
-            state["data_summary"] = "\n\n".join(summary_parts)
-
-    except Exception as e:
-        st.error(f"Error di Data Describer Agent: {e}")
-        state["data_summary"] = "Gagal membuat ringkasan data."
-        
-    return state
-
-# ==============================
-# 🤖 Agent 4: Retriever
+# 🤖 Agent 3: Data Processing Agent
 # ==============================
 def apply_filters(df: pd.DataFrame, params: dict) -> pd.DataFrame:
     """Menerapkan serangkaian filter ke DataFrame berdasarkan parameter yang diekstrak."""
@@ -307,141 +260,142 @@ def apply_filters(df: pd.DataFrame, params: dict) -> pd.DataFrame:
         temp_df = temp_df[temp_df['Tanggal'].dt.month == params['bulan']]
     return temp_df
 
-def retriever_agent(state: AgentState):
-    """Mengambil data berdasarkan mode dan parameter, mendukung query multi-kriteria dan statistik."""
+def data_processing_agent(state: AgentState):
+    """
+    Agen terpadu untuk memfilter, menganalisis, dan menyiapkan konteks atau jawaban langsung.
+    Menerapkan logika fallback jika query spesifik tidak menghasilkan apa-apa.
+    """
     try:
         mode = state.get("mode", "general_fallback")
         params = state.get("params", {})
         
         if df is None:
-            state["context"] = "⚠️ Data tidak tersedia."
+            state["answer"] = "⚠️ Data tidak tersedia."
             return state
-        
-        if mode == "filter_data_query":
-            filtered_df = apply_filters(df, params)
-            if filtered_df.empty:
-                state["context"] = "Tidak ada data yang cocok dengan kombinasi kriteria Anda."
-            else:
-                state["context"] = filtered_df.head(15).to_csv(index=False)
-        
-        elif mode == "statistical_query":
-            filtered_df = apply_filters(df, params) # Terapkan filter dasar dulu (misal: bulan)
-            q = state['question'].lower()
-            
-            if "trend" in q and "bulan" in q:
-                filtered_df['Bulan'] = filtered_df['Tanggal'].dt.to_period('M')
-                trend = filtered_df.groupby('Bulan').size().sort_index()
-                context_text = "Tren override per bulan (dengan filter aktif):\n"
-                for period, count in trend.items():
-                    context_text += f"- {period}: {count} override\n"
-                state["context"] = context_text
-            elif "terbanyak" in q:
-                target_col = "Area" # Default
-                if "pic" in q: target_col = "PIC"
-                elif "alasan" in q: target_col = "Alasan"
 
-                if filtered_df.empty:
-                    state["context"] = f"Tidak ada data untuk dianalisis dengan filter yang diberikan."
+        # 1. Selalu terapkan filter di awal
+        filtered_df = apply_filters(df, params)
+        q = state['question'].lower()
+        
+        # 2. Coba proses mode yang bisa memberikan jawaban langsung (direct answer)
+        if mode == "statistical_query":
+            if "trend" in q and "bulan" in q:
+                if not filtered_df.empty:
+                    filtered_df['Bulan'] = filtered_df['Tanggal'].dt.to_period('M')
+                    trend = filtered_df.groupby('Bulan').size().sort_index()
+                    answer_text = "Tren override per bulan (dengan filter aktif):\n"
+                    for period, count in trend.items():
+                        answer_text += f"- {period}: {count} override\n"
+                    state["answer"] = answer_text
+                    return state
+            elif "terbanyak" in q or "paling umum" in q or "distribusi" in q:
+                COLUMN_KEYWORDS = {"Area": ["area"],"Status": ["status"],"Level Urgensi": ["urgensi", "level urgensi"],"PIC": ["pic", "person in charge", "siapa"],"Alasan": ["alasan", "penyebab"],"Override by": ["override oleh"],"Manager": ["manager", "manajer"]}
+                target_col = next((col for col, kw in COLUMN_KEYWORDS.items() if any(k in q for k in kw)), None)
+                if not target_col:
+                    state["answer"] = "Mohon sebutkan kolom apa yang ingin Anda lihat peringkatnya (misalnya 'area terbanyak', 'pic terbanyak')."
+                    return state
+                if not filtered_df.empty:
+                    counts = filtered_df[target_col].value_counts()
+                    answer_text = f"Peringkat '{target_col}' dengan override terbanyak (dengan filter aktif):\n"
+                    for item, count in counts.head(5).items():
+                        answer_text += f"- {item}: {count} override\n"
+                    state["answer"] = answer_text
                     return state
 
-                counts = filtered_df[target_col].value_counts()
-                context_text = f"Peringkat '{target_col}' dengan override terbanyak (dengan filter aktif):\n"
-                for item, count in counts.head(5).items():
-                    context_text += f"- {item}: {count} override\n"
-                state["context"] = context_text
-            else:
-                state["context"] = "Maaf, jenis analisis statistik ini belum didukung."
-
         elif mode == "comparison_query":
-            q = state['question'].lower()
             items_to_compare = list(set(re.findall(r'(rmk1|rmk2|fmd|rmp)', q)))
-            if len(items_to_compare) < 2:
-                state["context"] = "Mohon sebutkan setidaknya dua area (RMK1, RMK2, FMD, RMP) untuk dibandingkan."
+            if len(items_to_compare) >= 2:
+                answer_text = "Hasil perbandingan jumlah override (dengan filter aktif):\n"
+                for area in items_to_compare:
+                    count = len(filtered_df[filtered_df['Area'].str.contains(area, case=False, na=False)])
+                    answer_text += f"- Area {area.upper()}: {count} override\n"
+                state["answer"] = answer_text
                 return state
             
-            filtered_df = apply_filters(df, params)
-            context_text = "Hasil perbandingan jumlah override (dengan filter aktif):\n"
-            for area in items_to_compare:
-                count = len(filtered_df[filtered_df['Area'].str.contains(area, case=False, na=False)])
-                context_text += f"- Area {area.upper()}: {count} override\n"
-            state["context"] = context_text
+        elif mode == 'count_query':
+            state['answer'] = f"Ditemukan total {len(filtered_df)} data override dengan kriteria yang diberikan."
+            return state
 
-        elif mode == "latest_override":
-            latest_entry = df.sort_values(by="Tanggal", ascending=False).iloc[0]
-            state["context"] = f"Override terbaru:\n- Tanggal: {latest_entry['Tanggal']}\n- HAC: {latest_entry['HAC']}\n- Alasan: {latest_entry['Alasan']}\n- Override oleh: {latest_entry['Override by']}"
-        
-        elif mode == "oldest_override":
-            oldest_entry = df.sort_values(by="Tanggal", ascending=True).iloc[0]
-            state["context"] = f"Override terdahulu:\n- Tanggal: {oldest_entry['Tanggal']}\n- HAC: {oldest_entry['HAC']}\n- Alasan: {oldest_entry['Alasan']}\n- Override oleh: {oldest_entry['Override by']}"
+        elif mode == "latest_query":
+            if not filtered_df.empty:
+                latest_entry = filtered_df.sort_values(by="Tanggal", ascending=False).iloc[0]
+                state["answer"] = f"Override terbaru (dengan filter aktif):\n- Tanggal: {latest_entry['Tanggal']}\n- HAC: {latest_entry['HAC']}\n- Alasan: {latest_entry['Alasan']}\n- Override oleh: {latest_entry['Override by']}"
+            else:
+                state["answer"] = "Tidak ada data yang cocok dengan kriteria Anda untuk menemukan data terbaru."
+            return state
+
+        elif mode == "oldest_query":
+            if not filtered_df.empty:
+                oldest_entry = filtered_df.sort_values(by="Tanggal", ascending=True).iloc[0]
+                state["answer"] = f"Override terdahulu (dengan filter aktif):\n- Tanggal: {oldest_entry['Tanggal']}\n- HAC: {oldest_entry['HAC']}\n- Alasan: {oldest_entry['Alasan']}\n- Override oleh: {oldest_entry['Override by']}"
+            else:
+                state["answer"] = "Tidak ada data yang cocok dengan kriteria Anda untuk menemukan data terdahulu."
+            return state
         
         elif mode == "list_entities_query":
-            q = state['question'].lower()
             col_map = {"pic": "PIC", "manager": "Manager", "override by": "Override by", "area": "Area"}
-            target_col = "PIC" 
-            for keyword, col_name in col_map.items():
-                if keyword in q:
-                    target_col = col_name
-                    break
-            entities = df[target_col].dropna().unique()
-            state["context"] = f"Daftar untuk '{target_col}':\n- {', '.join(entities)}"
+            target_col = next((col for kw, col in col_map.items() if kw in q), "PIC")
+            entities = filtered_df[target_col].dropna().unique()
+            if len(entities) > 0:
+                state["answer"] = f"Daftar untuk '{target_col}' (dengan filter aktif):\n- {', '.join(entities)}"
+            else:
+                state["answer"] = f"Tidak ditemukan entitas '{target_col}' yang cocok dengan kriteria Anda."
+            return state
 
-        elif mode == 'count_query':
-            filtered_df = apply_filters(df, params)
-            state['context'] = f"Ditemukan total {len(filtered_df)} data override dengan kriteria yang diberikan."
-
-        else: # general_fallback
-             state['context'] = df.head().to_csv(index=False)
+        # 3. Logika Fallback / Default
+        if not filtered_df.empty:
+            summary_message = f"Ditemukan {len(filtered_df)} data yang cocok dengan kriteria Anda."
+            if mode not in ["filter_data_query", "general_fallback"]:
+                summary_message = f"Tidak dapat menemukan hasil spesifik untuk '{mode}', namun " + summary_message.lower()
+            
+            summary_message += " Berikut adalah 5 contoh teratas:"
+            sample_data = filtered_df.head(5).to_csv(index=False)
+            state["context"] = f"{summary_message}\n\n{sample_data}"
+        else:
+            state["answer"] = "Tidak ada data yang cocok dengan kombinasi kriteria Anda."
 
     except Exception as e:
-        st.error(f"Error di Retriever Agent: {e}")
-        state["context"] = "Maaf, terjadi kesalahan saat mengambil dan memproses data."
+        st.error(f"Error di Data Processing Agent: {e}")
+        state["answer"] = "Maaf, terjadi kesalahan saat mengambil dan memproses data."
 
     return state
 
+
 # ==============================
-# 🤖 Agent 5: Answer (LLM + Token Log)
+# 🤖 Agent 4: Answer (LLM + Token Log)
 # ==============================
 def answer_agent(state: AgentState):
     """
-    Agent untuk menjawab pertanyaan user menggunakan LLM, dengan konteks tambahan dari Data Describer.
+    Agent LLM yang hanya akan berjalan jika tidak ada jawaban langsung dari agent sebelumnya.
     """
+    # *** INI ADALAH KUNCI PENGHEMATAN TOKEN ***
+    # Jika state "answer" sudah diisi, berarti jawaban sudah final. Langsung kembalikan.
     if state.get("answer"):
-        return state
-    
-    direct_answer_indicators = ["daftar untuk", "hasil perbandingan", "tren override", "peringkat", "total", "adalah", "terbaru:", "terdahulu:"]
-
-    context_lower = state.get("context", "").lower()
-    if any(indicator in context_lower for indicator in direct_answer_indicators) or "tidak ada data" in context_lower:
-        state["answer"] = state["context"]
         return state
 
     try:
         user_question = state["question"]
-        context = state["context"]
-        data_summary = state.get("data_summary", "Tidak ada.")
+        context = state.get("context", "Tidak ada konteks yang relevan.")
         model = "gpt-4o-mini"
         
         full_prompt = (
-            f"Anda adalah asisten data. Jawab pertanyaan pengguna berdasarkan informasi yang diberikan.\n"
-            f"Anda memiliki dua sumber informasi:\n"
-            f"1. Ringkasan Statistik: Ini adalah data agregat yang mungkin bisa langsung menjawab pertanyaan tentang jumlah atau distribusi.\n"
-            f"2. Potongan Data Mentah: Ini adalah beberapa baris contoh data yang relevan.\n\n"
-            f"--- RINGKASAN STATISTIK ---\n{data_summary}\n\n"
-            f"--- POTONGAN DATA MENTAH ---\n{context}\n\n"
-            f"--- PERTANYAAN ---\n{user_question}\n\n"
-            f"Prioritaskan jawaban dari Ringkasan Statistik jika memungkinkan (misalnya untuk menjawab 'berapa banyak'). Gunakan data mentah untuk detail tambahan jika perlu."
+            f"Anda adalah asisten data. Jawab pertanyaan pengguna berdasarkan ringkasan dan contoh data berikut.\n"
+            f"Sajikan jawaban dalam format yang mudah dibaca dan ramah.\n\n"
+            f"--- KONTEKS DATA ---\n{context}\n\n"
+            f"--- PERTANYAAN ---\n{user_question}"
         )
 
         completion = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "Anda adalah asisten data yang cerdas. Jawab pertanyaan hanya dari konteks yang ada. Sajikan jawaban dalam format yang mudah dibaca, gunakan poin-poin jika perlu."},
+                {"role": "system", "content": "Anda adalah asisten data yang cerdas. Jawab pertanyaan hanya dari konteks yang ada. Jangan membuat informasi baru."},
                 {"role": "user", "content": full_prompt},
             ],
         )
         output_text = completion.choices[0].message.content
         state["answer"] = output_text.strip()
         
+        # Logging hanya terjadi jika LLM benar-benar dipanggil
         input_tokens = count_tokens(full_prompt, model)
         output_tokens = count_tokens(output_text, model)
         token_log = {
@@ -472,15 +426,13 @@ workflow = StateGraph(AgentState)
 
 workflow.add_node("bert_router", bert_router_agent)
 workflow.add_node("classifier", classifier_agent)
-workflow.add_node("data_describer", data_describer_agent)
-workflow.add_node("retriever", retriever_agent)
+workflow.add_node("data_processor", data_processing_agent)
 workflow.add_node("answer", answer_agent)
 
 workflow.set_entry_point("bert_router")
 workflow.add_edge("bert_router", "classifier")
-workflow.add_edge("classifier", "data_describer")
-workflow.add_edge("data_describer", "retriever")
-workflow.add_edge("retriever", "answer")
+workflow.add_edge("classifier", "data_processor")
+workflow.add_edge("data_processor", "answer")
 workflow.add_edge("answer", END)
 
 app = workflow.compile()
@@ -505,6 +457,10 @@ if st.button("💬 Tanya Agent", disabled=not data_loaded) and user_question.str
     if len(user_question) > 500:
         st.warning("Pertanyaan terlalu panjang. Harap persingkat pertanyaan Anda (maksimal 500 karakter).")
     else:
+        # Reset log token sebelum pemanggilan baru
+        if "last_token_log" in st.session_state:
+            del st.session_state["last_token_log"]
+
         with st.spinner("Para agent sedang bekerja..."):
             result = app.invoke({"question": user_question})
 
@@ -516,8 +472,8 @@ if st.button("💬 Tanya Agent", disabled=not data_loaded) and user_question.str
                     st.info("**Agent 1: BERT Router**")
                     st.json(st.session_state["bert_classification"])
                 
-                st.info("**Agent 4: Retriever**")
-                st.text_area("Konteks Data Mentah", value=result.get("context", "Tidak ada konteks yang diambil."), height=250)
+                st.info("**Agent 3: Data Processor**")
+                st.text_area("Konteks / Jawaban Langsung", value=result.get("context") or result.get("answer", "Tidak ada output."), height=250)
                 
             with col2:
                 st.info("**Agent 2: Classifier (Rules)**")
@@ -526,8 +482,12 @@ if st.button("💬 Tanya Agent", disabled=not data_loaded) and user_question.str
                     "parameter_terekstrak": result.get("params", {})
                 })
                 
-                st.info("**Agent 3: Data Describer**")
-                st.text_area("Ringkasan Statistik", value=result.get("data_summary", "Tidak ada ringkasan."), height=250)
+                if "last_token_log" in st.session_state:
+                    st.info("**Agent 4: Answer (LLM)**")
+                    st.write("LLM dipanggil untuk memproses jawaban.")
+                else:
+                    st.info("**Agent 4: Answer (LLM)**")
+                    st.write("LLM dilewati (bypass) karena jawaban sudah final.")
 
             st.divider()
             st.subheader("💡 Jawaban Akhir")
@@ -547,5 +507,5 @@ if st.button("💬 Tanya Agent", disabled=not data_loaded) and user_question.str
                     log_filename = f"token_log_{today}.txt"
                     st.info(f"Penggunaan token ini telah dicatat dalam file: **{log_filename}**")
                 else:
-                    st.info("Belum ada penggunaan token LLM yang tercatat untuk pertanyaan ini.")
+                    st.info("Tidak ada panggilan ke LLM, penggunaan token adalah 0.")
 
